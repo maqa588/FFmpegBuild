@@ -1,33 +1,32 @@
-<h1 align="center">FFmpegBuild</h1>
-
 <p align="center">
-  <b>Slim FFmpeg xcframeworks for Apple platforms.</b><br>
-  Demux, decode, and a thin HLS-fMP4 mux path for AVPlayer bridging. No network stack, no CLI binaries.
-</p>
-
-<p align="center">
-  <a href="https://github.com/superuser404notfound/FFmpegBuild/releases/latest"><img src="https://img.shields.io/github/v/release/superuser404notfound/FFmpegBuild?label=release&color=blue"></a>
-  <a href="https://swiftpackageindex.com/superuser404notfound/FFmpegBuild"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fsuperuser404notfound%2FFFmpegBuild%2Fbadge%3Ftype%3Dswift-versions"></a>
-  <a href="https://swiftpackageindex.com/superuser404notfound/FFmpegBuild"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fsuperuser404notfound%2FFFmpegBuild%2Fbadge%3Ftype%3Dplatforms"></a>
-  <img src="https://img.shields.io/badge/FFmpeg-8.1-brightgreen">
-  <img src="https://img.shields.io/badge/dav1d-1.5.1-blue">
-  <img src="https://img.shields.io/badge/license-LGPL--2.1-lightgrey">
-  <a href="https://ko-fi.com/superuser404"><img src="https://img.shields.io/badge/Ko--fi-Support-FF5E5B?logo=kofi&logoColor=white"></a>
+  <h1 align="center">FFmpegBuild</h1>
+  <p align="center">
+    <strong>Minimal, modular, modern FFmpeg for Apple platforms</strong>
+  </p>
+  <p align="center">
+    iOS 16+ &bull; macOS 13+
+  </p>
+  <p align="center">
+    <a href="https://swiftpackageindex.com/superuser404notfound/FFmpegBuild"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fsuperuser404notfound%2FFFmpegBuild%2Fbadge%3Ftype%3Dswift-versions"></a>
+    <a href="https://swiftpackageindex.com/superuser404notfound/FFmpegBuild"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fsuperuser404notfound%2FFFmpegBuild%2Fbadge%3Ftype%3Dplatforms"></a>
+    <img src="https://img.shields.io/badge/FFmpeg-8.1-brightgreen">
+    <img src="https://img.shields.io/badge/dav1d-1.5.4-blue">
+    <img src="https://img.shields.io/badge/license-LGPL--2.1-lightgrey">
+    <a href="https://ko-fi.com/superuser404"><img src="https://img.shields.io/badge/Ko--fi-Support-FF5E5B?logo=kofi&logoColor=white"></a>
+  </p>
 </p>
 
 ---
 
-## Why
+Full FFmpeg builds for iOS land at 40-70 MB and link every codec known to man. Most apps need a fraction of that: demuxing modern containers, feeding hardware decoders via VideoToolbox, software fallbacks for formats Apple doesn't support natively (AV1, VP9, DTS, TrueHD, FLAC), and bitstream filters.
 
-Full FFmpeg builds for iOS land at 40-70 MB because they bundle a TLS stack, encoders, filters, and a dozen protocols your app will never use. For a player, most of that is dead weight. Apple already ships HTTP/3, `URLSession`, `Network.framework`, VideoToolbox and AVFoundation. So this build strips out everything you don't need and keeps what you do.
-
-**~10 MB per architecture, zero network dependencies, one build script.**
+FFmpegBuild provides **prebuilt XCFrameworks** with a minimal surface area designed for media player apps.
 
 ## In
 
 | Library        | What it does                                          |
 | -------------- | ----------------------------------------------------- |
-| libavformat    | Demux MKV, MP4, WebM, MPEG-TS, MPEG-PS (VOB / DVD), AVI, OGG, FLV, plus raw elementary streams |
+| libavformat    | Demux MKV, MP4, WebM, MPEG-TS, MPEG-PS (VOB / DVD), HLS, AVI, ASF / WMV, OGG, FLV, SUP, WebVTT, plus raw elementary streams |
 | libavcodec     | Decode video + audio (with VideoToolbox bridge)       |
 | libavutil      | Shared primitives                                     |
 | libswresample  | Audio resampling / channel remap / format convert     |
@@ -36,7 +35,7 @@ Full FFmpeg builds for iOS land at 40-70 MB because they bundle a TLS stack, enc
 
 ## Out
 
-Anything the app layer should already handle or doesn't need:
+Anything the app layer should already handle, or that pulls in bloat:
 
 - Network / TLS: FFmpeg reads from an `avio_alloc_context` callback, you wire `URLSession` to it
 - Encoders, except FLAC and EAC3 (kept for the audio bridge that re-encodes non-streamable sources like TrueHD / DTS / DTS-HD MA. FLAC for the lossless 7.1 path, EAC3 5.1 for the default soundbar-compat path that surfaces surround via HDMI bitstream tunnel)
@@ -62,7 +61,7 @@ Needs Xcode 16+, Meson, Ninja, pkg-config and NASM. Only FFmpeg and dav1d are fe
 
 Output lands in `Sources/` as xcframeworks, ready to consume via Swift Package Manager. The shipped xcframeworks contain **dynamic frameworks** (dylib-in-framework, `@rpath` install names); Xcode embeds and signs them in the app bundle automatically when you link the package. That is what keeps the LGPL relink requirement satisfiable for closed-source apps, see License below.
 
-## Use
+## Usage
 
 ```swift
 // Package.swift
@@ -74,15 +73,15 @@ dependencies: [
 .product(name: "FFmpegBuild", package: "FFmpegBuild")
 ```
 
-Pin `branch: "main"` instead of a version if you want to track the latest rebuilds (that is how [AetherEngine](https://github.com/superuser404notfound/AetherEngine) consumes it).
+Pin `branch: "main"` instead of a version if you want to track the latest rebuilds.
 
 Then import the modules you need: `Libavformat`, `Libavcodec`, `Libavutil`, `Libswresample`, `Libswscale`, `Libdav1d`. The umbrella `FFmpegBuild` product links all of them plus the system frameworks (AudioToolbox, CoreMedia, CoreVideo, VideoToolbox) in one shot.
 
 ## Decoder support
 
 - **Video (hardware via VideoToolbox)**: H.264, HEVC up to Main10 (HDR10 / DV Profile 8)
-- **Video (software)**: AV1 (dav1d), VP9, VP8, MPEG-2, MPEG-4, VC-1
-- **Audio**: AAC, AC3, EAC3 (incl. JOC detection for Atmos), FLAC, MP2, MP3, Opus, Vorbis, TrueHD, MLP, DTS, ALAC, PCM (incl. Blu-ray LPCM via `pcm_bluray`)
+- **Video (software)**: AV1 (dav1d), VP9, VP8, MPEG-2, MPEG-4, VC-1, QuickTime RLE (qtrle), and the legacy Microsoft tail: MS-MPEG4 v1 / v2 / v3 (DivX 3.x in pre-2005 AVI rips), WMV1 / WMV2, WMV3 (WMV9). A native `.wmv` / `.asf` plays whole: the `asf` demuxer and every WMA decoder ship with it. The Flash tail is here: FLV1 (Sorenson Spark) and On2 VP6 / VP6F / VP6A with the era's audio, so a legacy `.flv` plays whole where before only H.264-in-FLV did. Flash Screen Video stays out (requires zlib).
+- **Audio**: AAC, AC3, EAC3 (incl. JOC detection for Atmos), FLAC, MP2, MP3, Opus, Vorbis, TrueHD, MLP, DTS, ALAC, PCM (incl. Blu-ray LPCM via `pcm_bluray`, G.711 A-law / mu-law, big-endian and unsigned 8-bit), WMA Standard / Pro / Lossless / Voice, Nellymoser Asao, ADPCM-SWF, Speex
 - **Subtitles**: SRT, ASS, SSA, WebVTT, PGS, DVB, DVD
 
 HDR metadata (BT.2020, SMPTE ST 2084 / PQ, HLG, DV RPU) is preserved end-to-end so the decode pipeline can tag frames correctly.
@@ -97,6 +96,14 @@ Release configuration, dynamic framework binaries as embedded in the app:
 | macOS universal (arm64 + x86_64)  | ~18.1 MB  | ~2.4 MB  | ~20.5 MB  |
 
 Assembly-optimized paths are enabled where the Apple toolchain permits.
+
+## Local FFmpeg patches
+
+`build.sh` applies small patches to the FFmpeg source after checkout:
+
+- **`patch_ffmpeg_pgssub`**: closes the predecessor cue on a missing pgssub palette (AetherEngine issue 142, FFmpeg PR 23851).
+- **`patch_ffmpeg_visionos`**: `videotoolbox.c` skips `kCVPixelBufferOpenGLESCompatibilityKey` on visionOS, where OpenGL ES is unavailable.
+- **`patch_ffmpeg_matroska_tts`**: `matroskadec.c` logs a warning when a Matroska track carries a `TrackTimestampScale` other than 1.0 (AetherEngine issue 145, FFmpeg PR 23852).
 
 ## Built with
 
@@ -116,14 +123,8 @@ All shipped third-party license texts live in [LICENSES/](LICENSES/).
 
 ### Shipping in an App Store app
 
-The xcframeworks are dynamic frameworks on purpose: LGPL section 6 requires that end users can swap in a modified version of the library. With dynamic linking your app binary stays yours (closed source is fine) and the obligations reduce to:
+FFmpegBuild ships under **LGPL 2.1**. Apple's App Store allows LGPL dynamic frameworks as long as the user's right to reverse-engineer and re-link the LGPL portions is preserved.
 
-1. Link the package normally; Xcode embeds the frameworks in `YourApp.app/Frameworks/`. Do not merge them into the app binary (no mergeable-library trickery), that would recreate static linking.
-2. Reproduce the license texts from [LICENSES/](LICENSES/) somewhere reasonable (acknowledgements screen, bundled file).
-3. State that your app uses FFmpeg and friends, and link to the source of the exact build you ship (a tagged release of this repo, or your fork if you modified it).
-
-If you build the `static` variant instead, those steps are not sufficient: LGPL 6(a) then requires you to provide your app's object files (or full source) so users can relink. That is realistic for open-source apps and rarely anything else, which is why static is not the shipped shape.
-
----
-
-<p align="center"><sub>Used by <a href="https://github.com/superuser404notfound/AetherEngine">AetherEngine</a>.</sub></p>
+1. Distribute your app as usual with FFmpegBuild embedded as **dynamic frameworks** (the default `build.sh` output). Do not use static linkage for closed-source App Store builds.
+2. Provide a copy of the [LGPL 2.1 license](LICENSES/LGPL-2.1.txt) in your app's acknowledgements / legal screen.
+3. Keep the build scripts reproducible (they are, via this repo) so users can build replacement binaries for their own use.

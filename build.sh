@@ -13,7 +13,7 @@ set -eo pipefail  # pipefail so `... | tail -N` doesn't swallow configure/make e
 
 FFMPEG_VERSION="n8.1.2"
 FFMPEG_REPO="https://github.com/FFmpeg/FFmpeg.git"
-DAV1D_VERSION="1.5.1"
+DAV1D_VERSION="1.5.4"
 DAV1D_REPO="https://code.videolan.org/videolan/dav1d.git"
 SCRIPT_DIR="${0:a:h}"
 BUILD_DIR="${SCRIPT_DIR}/build"
@@ -65,7 +65,23 @@ fi
 
 # ─────────────────────────────────────────────────────────
 
+discard_stale_source() {
+    # The fetch functions below skip the clone when the source directory already exists, so
+    # bumping a version string alone would rebuild the OLD source and produce a release that
+    # changed nothing. Drop a tree whose checked-out tag is not the one asked for and let the
+    # caller re-clone. Verified against the shallow `--depth 1 --branch <tag>` clones these
+    # functions create: `describe --tags --exact-match` returns the tag on each of them.
+    local dir="$1" want="$2" have
+    [[ -d "${dir}" ]] || return 0
+    have="$(git -C "${dir}" describe --tags --exact-match 2>/dev/null)"
+    if [[ "${have}" != "${want}" ]]; then
+        echo "→ ${dir:t} is at '${have:-unknown}', want '${want}': discarding and re-cloning"
+        rm -rf "${dir}"
+    fi
+}
+
 fetch_ffmpeg() {
+    discard_stale_source "${FFMPEG_SRC}" "${FFMPEG_VERSION}"
     if [[ -d "${FFMPEG_SRC}" ]]; then
         echo "→ FFmpeg source already exists, skipping clone"
         return
@@ -74,7 +90,75 @@ fetch_ffmpeg() {
     git clone --depth 1 --branch "${FFMPEG_VERSION}" "${FFMPEG_REPO}" "${FFMPEG_SRC}"
 }
 
+patch_ffmpeg_pgssub() {
+    # AetherEngine #142, second shape (FFmpeg PR 23851). PGS carries no end time,
+    # a cue is closed by the start of its successor, so dropping a damaged display
+    # set also removes the successor that would have closed the previous cue: the
+    # predecessor overstays its authored end until the next intact set arrives.
+    # Outside AV_EF_EXPLODE, emit the empty subtitle instead. The pts is already
+    # set and no rect has been allocated yet, so this is the same clearing form
+    # the object_count == 0 path a few lines above returns.
+    local F="${FFMPEG_SRC}/libavcodec/pgssubdec.c"
+    grep -q "pgs-missing-palette" "${F}" && return
+    echo "→ Patching FFmpeg: close the predecessor cue on a missing pgssub palette (AetherEngine #142)"
+    perl -0777 -pi -e '
+s#               ctx->presentation\.palette_id\);\n        avsubtitle_free\(sub\);\n        return AVERROR_INVALIDDATA;\n    \}#               ctx->presentation.palette_id);\n        /* pgs-missing-palette: dropping the set here would also drop the successor\n         * that closes the previous cue, so the predecessor overstays its authored\n         * end. Outside AV_EF_EXPLODE emit the empty subtitle instead: the pts is\n         * set, no rect is allocated yet, and this is the clearing form the\n         * object_count == 0 path above returns.\n         * See FFmpegBuild build.sh patch_ffmpeg_pgssub (AetherEngine issue 142,\n         * FFmpeg PR 23851). */\n        if (avctx->err_recognition \& AV_EF_EXPLODE) {\n            avsubtitle_free(sub);\n            return AVERROR_INVALIDDATA;\n        }\n        av_freep(\&sub->rects);\n        return 1;\n    }#;
+' "${F}"
+    if ! grep -q "pgs-missing-palette" "${F}"; then
+        echo "ERROR: pgssubdec missing-palette patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
+patch_ffmpeg_visionos() {
+    # visionOS has no OpenGL and no OpenGL ES, so kCVPixelBufferOpenGLESCompatibilityKey
+    # is marked unavailable there. Upstream picks that key on TARGET_OS_IPHONE, which is 1
+    # on visionOS (TARGET_OS_IOS is the one that is 0), so the hardware-decode path fails
+    # to compile for xros with "'kCVPixelBufferOpenGLESCompatibilityKey' is unavailable".
+    # Nothing is lost by omitting it: the attribute only asks CoreVideo to make the buffer
+    # bindable as a GL texture, and on visionOS every consumer is Metal, which the
+    # IOSurface backing set just above already covers. TARGET_OS_VISION is defined as 0 on
+    # SDKs that predate it, and an undefined macro evaluates to 0 in #if, so this is safe
+    # on every other slice.
+    local F="${FFMPEG_SRC}/libavcodec/videotoolbox.c"
+    grep -q "TARGET_OS_VISION" "${F}" && return
+    echo "→ Patching FFmpeg: skip the OpenGL ES buffer attribute on visionOS"
+    perl -0777 -pi -e '
+s@\#if TARGET_OS_IPHONE\n    CFDictionarySetValue\(buffer_attributes, kCVPixelBufferOpenGLESCompatibilityKey, kCFBooleanTrue\);\n\#else@\#if TARGET_OS_VISION\n    /* visionOS has neither OpenGL ES nor OpenGL, and the key is unavailable there.\n     * Consumers are Metal, which the IOSurface properties above already cover.\n     * See FFmpegBuild build.sh patch_ffmpeg_visionos. */\n\#elif TARGET_OS_IPHONE\n    CFDictionarySetValue(buffer_attributes, kCVPixelBufferOpenGLESCompatibilityKey, kCFBooleanTrue);\n\#else@;
+' "${F}"
+    if ! grep -q "TARGET_OS_VISION" "${F}"; then
+        echo "ERROR: visionOS videotoolbox patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
+patch_ffmpeg_matroska_tts() {
+    # AetherEngine #145, reworked after upstream review (FFmpeg PR 23852):
+    # RFC 9559 (11.1.3, 11.2, 5.1.3.5.3) puts Block/SimpleBlock relative
+    # timestamps and BlockDuration in Track Ticks, so absolute time is
+    # (cluster + rel x TTS) x TimestampScale, and upstream matroskadec
+    # implements exactly that. The earlier clamp here (any TTS != 1 forced to
+    # 1.0) rested on a wrong reading of the RFC and would mistime a conformant
+    # TTS != 1 file; the file that motivated it was authored on the segment
+    # axis (invalid per RFC). What remains worth carrying: TTS != 1 is
+    # deprecated (maxver 3), many readers ignore it, and a file carrying it may
+    # have been authored against such readers. Emit a warning next to
+    # upstream's own "< 0.01" guard so the condition is visible; timestamp
+    # behavior stays RFC.
+    local F="${FFMPEG_SRC}/libavformat/matroskadec.c"
+    grep -q "AetherEngine issue 145" "${F}" && return
+    echo "→ Patching FFmpeg: warn on matroska TrackTimestampScale != 1 (AetherEngine #145)"
+    perl -0777 -pi -e '
+s#        if \(track->time_scale < 0\.01\) \{\n            av_log\(matroska->ctx, AV_LOG_WARNING,\n                   "Track TimestampScale too small %f, assuming 1\.0\.\\n",\n                   track->time_scale\);\n            track->time_scale = 1\.0;\n        \}#        if (track->time_scale < 0.01) {\n            av_log(matroska->ctx, AV_LOG_WARNING,\n                   "Track TimestampScale too small %f, assuming 1.0.\\n",\n                   track->time_scale);\n            track->time_scale = 1.0;\n        } else if (track->time_scale != 1.0) {\n            /* Applied per RFC 9559: block timestamps and BlockDuration are\n             * Track Ticks, scaled against the segment axis. The element is\n             * deprecated (maxver 3) and many readers ignore it, so a file\n             * carrying it may have been authored against such readers; surface\n             * it instead of staying silent. See FFmpegBuild build.sh\n             * patch_ffmpeg_matroska_tts (AetherEngine issue 145). */\n            av_log(matroska->ctx, AV_LOG_WARNING,\n                   "TrackTimestampScale %f applied per RFC 9559; many readers "\n                   "ignore this element and files may be authored against them.\\n",\n                   track->time_scale);\n        }#;
+' "${F}"
+    if ! grep -q "AetherEngine issue 145" "${F}"; then
+        echo "ERROR: matroska TrackTimestampScale patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
 fetch_dav1d() {
+    discard_stale_source "${DAV1D_SRC}" "${DAV1D_VERSION}"
     if [[ -d "${DAV1D_SRC}" ]]; then
         echo "→ dav1d source already exists, skipping clone"
         return
@@ -164,14 +248,38 @@ COMMON_FLAGS=(
     --enable-videotoolbox --enable-audiotoolbox
     --enable-libdav1d
     --enable-protocol=file --enable-protocol=pipe --enable-protocol=data
+    # concat is deliberately NOT enabled. It is a script demuxer: a file beginning with
+    # "ffconcat version 1.0" makes libavformat open the paths listed inside it through the
+    # file protocol. Nothing here asks for it by name, so probing was the only way to reach
+    # it, and that made any byte stream a potential file-open primitive. hls and dash stay in:
+    # they are a documented capability of this package (README) and consumers rely on them.
     --disable-demuxers
+    # dash is NOT enabled: its demuxer needs libxml2, which this build does not link, so
+    # configure answered `Disabled dash_demuxer because not all dependencies are satisfied`
+    # and the flag silently did nothing. Asking for it again without libxml2 would only
+    # restore that false impression. DASH content still arrives through mov/mpegts segments.
     --enable-demuxer=hls --enable-demuxer=matroska
     --enable-demuxer=mov --enable-demuxer=mpegts --enable-demuxer=mpegps
     --enable-demuxer=avi --enable-demuxer=flv --enable-demuxer=h264
+    # asf: native .wmv / .asf. Enabled together with the whole WMA decoder family
+    # below and never without it, see the block there. Unlike the concat demuxer
+    # removed above this is a plain media demuxer, no file-open primitive.
+    --enable-demuxer=asf
     --enable-demuxer=hevc --enable-demuxer=aac --enable-demuxer=ac3
     --enable-demuxer=eac3 --enable-demuxer=flac --enable-demuxer=ogg
     --enable-demuxer=wav --enable-demuxer=mp3 --enable-demuxer=srt
-    --enable-demuxer=ass --enable-demuxer=concat --enable-demuxer=data
+    --enable-demuxer=ass --enable-demuxer=data
+    # sup: raw PGS/SUP sidecar files (Jellyfin serves external PGS tracks as raw .sup streams;
+    # the pgssub DECODER was always in, but without this demuxer avformat_open_input rejects the
+    # file with AVERROR_INVALIDDATA and external PGS subtitles never load. AetherEngine sidecar path.)
+    --enable-demuxer=sup
+    # webvtt: standalone .vtt sidecar files. The webvtt DECODER was always in (it serves WebVTT
+    # tracks inside Matroska and HLS, where those demuxers supply the stream), but without this
+    # demuxer avformat_open_input rejects a .vtt file with AVERROR_INVALIDDATA and an external
+    # WebVTT subtitle never loads. Same shape as the sup case above. It also carries the cue
+    # settings: the demuxer attaches line/position/align to each packet as
+    # AV_PKT_DATA_WEBVTT_SETTINGS, which is the only path they take (the decoder drops them).
+    --enable-demuxer=webvtt
     # Raw MPEG-1/2 and MPEG-4 video elementary-stream demuxers. The mpegps
     # (MPEG Program Stream / DVD VOB) demuxer carries no codec signaling, so
     # it tags a 0x1E0-0x1EF video stream as request_probe and confirms the
@@ -185,11 +293,75 @@ COMMON_FLAGS=(
     --enable-decoder=h264 --enable-decoder=hevc --enable-decoder=vp8
     --enable-decoder=vp9 --enable-decoder=av1 --enable-decoder=libdav1d
     --enable-decoder=mpeg2video --enable-decoder=mpeg4 --enable-decoder=vc1
+    --enable-decoder=qtrle
+    # Legacy Microsoft video, the MPEG-4-family tail that pre-2005 AVI rips and
+    # WMV-era remuxes still carry (FFmpegBuild#3). All are native libavcodec
+    # decoders under FFmpeg's LGPL-2.1-or-later terms: no external library, no GPL
+    # flag. msmpeg4v1/v2/v3 and wmv1/wmv2 share the msmpeg4dec object, so once v3
+    # (MS-MPEG4 v3 / "DivX 3.11", the reported case) is in, its siblings cost their
+    # decoder structs plus wmv2dsp; wmv3 (WMV9) selects the already-enabled
+    # vc1_decoder and adds little beyond its own registration. Without them
+    # avcodec_find_decoder returns nil and AetherEngine's software path fails the
+    # load with unsupportedCodec, because since FFmpegBuild#1 the routing default is
+    # software for everything the native path does not carry. The avi demuxer above
+    # is already enabled, so the AVI case is complete with the decoder alone.
+    --enable-decoder=msmpeg4v1 --enable-decoder=msmpeg4v2 --enable-decoder=msmpeg4v3
+    --enable-decoder=wmv1 --enable-decoder=wmv2 --enable-decoder=wmv3
+    # Flash Video, the legacy half. The flv DEMUXER has been on the list above since
+    # the beginning, so a modern .flv (H.264 + AAC, everything after 2008) already
+    # direct-plays; what was missing is the decoder tail of the Flash era. FLV1 is
+    # Sorenson Spark, the H.263 variant of every pre-2008 file, and it shares the
+    # h263 / mpeg4 objects already compiled in; vp6 / vp6a / vp6f are the On2 family
+    # Flash 8 brought and pay for the vp56 core once. Note the registered name: the
+    # FLV1 decoder answers to `flv`, which is also what configure wants here, so a
+    # consumer asking for `flv1` by name finds nothing (AetherEngine dispatches by
+    # id and does not care).
+    #
+    # Flash Screen Video (flashsv / flashsv2) is deliberately out: it needs zlib,
+    # which --disable-autodetect above switches off, so the flag would be dropped
+    # without a word, exactly like the dash demuxer. Screen recordings are also not
+    # what a film library holds. Enabling it means --enable-zlib and counting the
+    # generated decoder list afterwards, not adding a flag.
+    --enable-decoder=flv --enable-decoder=vp6 --enable-decoder=vp6a --enable-decoder=vp6f
+    # Windows Media audio, the whole family, which is what makes the native .wmv /
+    # .asf case complete: demuxer above, video decoders on the line above this one,
+    # sound here. #3 closed the other way in August 2026 on the reporter's answer
+    # that their library holds WMV only inside Matroska and MPEG-TS; a second field
+    # report in September 2026 said the native form does turn up, so the boundary
+    # moved rather than the argument.
+    #
+    # All five, not the two a .wmv usually carries, because this chain is
+    # all-or-nothing by construction. A decoder left out here is a file that plays
+    # SILENTLY: AetherEngine's audio bridge asks libavcodec for a decoder by id, that
+    # lookup returns nothing, and the session falls to video-only, which reads as a
+    # playback bug where an honest unsupported-format error would not. Measured
+    # 2026-09-10 with a codec this build omits: `AudioBridge: no FFmpeg decoder for
+    # source codec id 69633 ... falling back to SILENT video-only`. Note the level:
+    # the host's routing table is NOT what decides this, a codec it does not name
+    # still plays as long as the decoder is here, so the promise is made in this
+    # file and nowhere else. wmav1 / wmav2 are WMA
+    # Standard, wmapro is WMA 9/10 Pro and the usual audio of anything post-2003,
+    # wmalossless and wmavoice are rare in film content and cost tens of KB between
+    # them, which is less than one silent-audio report costs. WMA is not fMP4-legal,
+    # so AetherEngine's AudioBridge decodes and re-encodes it, same as MP2 and
+    # Blu-ray LPCM below. DecoderAvailabilityTests refuses a half set from here on.
+    --enable-decoder=wmav1 --enable-decoder=wmav2 --enable-decoder=wmapro
+    --enable-decoder=wmalossless --enable-decoder=wmavoice
     --enable-decoder=aac --enable-decoder=aac_latm --enable-decoder=ac3
     --enable-decoder=eac3 --enable-decoder=flac --enable-decoder=mp3
     --enable-decoder=mp3float --enable-decoder=opus --enable-decoder=vorbis
     --enable-decoder=truehd --enable-decoder=mlp --enable-decoder=dca --enable-decoder=alac
     --enable-decoder=pcm_s16le --enable-decoder=pcm_s24le --enable-decoder=pcm_f32le
+    # Flash Video audio, the whole tail, all-or-nothing for the same reason the WMA
+    # family above is: a decoder missing here is a file that plays as a silent film
+    # rather than failing honestly, because the bridge has nothing to open. Nellymoser Asao and ADPCM-SWF are what the
+    # Flash era recorded, speex is its voice codec (native decoder, no libspeex),
+    # and FLV's PCM shapes are big-endian S16, unsigned 8-bit and G.711 A-law /
+    # mu-law, none of which the little-endian line above carries. None is fMP4-legal,
+    # so every one of them goes through AudioBridge. Tens of KB between them.
+    --enable-decoder=nellymoser --enable-decoder=adpcm_swf --enable-decoder=speex
+    --enable-decoder=pcm_s16be --enable-decoder=pcm_u8
+    --enable-decoder=pcm_alaw --enable-decoder=pcm_mulaw
     # Blu-ray LPCM (PCM_BLURAY): M2TS audio tracks that ship raw LPCM. Not
     # legal in fMP4, so AetherEngine's AudioBridge decodes to PCM and
     # re-encodes; without the decoder those tracks are silent. Prep for
@@ -521,6 +693,9 @@ echo "║  Linkage: ${LINKAGE}                     ║"
 echo "╚══════════════════════════════════════╝"
 
 fetch_ffmpeg
+patch_ffmpeg_pgssub
+patch_ffmpeg_visionos
+patch_ffmpeg_matroska_tts
 fetch_dav1d
 
 # Build dav1d for the three supported architecture targets first.
