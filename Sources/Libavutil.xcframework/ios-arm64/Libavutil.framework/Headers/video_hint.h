@@ -23,8 +23,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "libavutil/avassert.h"
-#include "libavutil/frame.h"
+#include "Libavutil/avassert.h"
+#include "Libavutil/frame.h"
 
 typedef struct AVVideoRect {
     uint32_t x, y;

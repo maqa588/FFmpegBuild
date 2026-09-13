@@ -532,6 +532,13 @@ make_framework() {
         cp -R "${HEADER_SRC}/"* "${FW_DIR}/Headers/"
     fi
 
+    # Rewrite cross-framework includes so Clang resolves them on case-sensitive filesystems
+    for SIBLING in libavcodec libavformat libavutil libswresample libswscale; do
+        local UPPER="Lib${SIBLING:3}"
+        LC_ALL=C sed -i "" -E "s|(#include[[:space:]]*\")${SIBLING}/|\\1${UPPER}/|g" \
+            "${FW_DIR}/Headers/"*.h 2>/dev/null || true
+    done
+
     # Remove platform-specific hwcontext headers (FFmpeg only)
     if [[ "${LIB}" == lib* ]]; then
         rm -f "${FW_DIR}/Headers/hwcontext_amf.h" \

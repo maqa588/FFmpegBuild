@@ -23,15 +23,15 @@
 
 #include <stdint.h>
 
-#include "libavutil/avutil.h"
-#include "libavutil/hwcontext.h"
-#include "libavutil/log.h"
-#include "libavutil/pixfmt.h"
-#include "libavutil/rational.h"
-#include "libavutil/samplefmt.h"
+#include "Libavutil/avutil.h"
+#include "Libavutil/hwcontext.h"
+#include "Libavutil/log.h"
+#include "Libavutil/pixfmt.h"
+#include "Libavutil/rational.h"
+#include "Libavutil/samplefmt.h"
 
-#include "libavcodec/codec_id.h"
-#include "libavcodec/version_major.h"
+#include "Libavcodec/codec_id.h"
+#include "Libavcodec/version_major.h"
 
 /**
  * @addtogroup lavc_core

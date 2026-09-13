@@ -24,13 +24,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "libavutil/attributes.h"
-#include "libavutil/buffer.h"
-#include "libavutil/dict.h"
-#include "libavutil/rational.h"
-#include "libavutil/version.h"
+#include "Libavutil/attributes.h"
+#include "Libavutil/buffer.h"
+#include "Libavutil/dict.h"
+#include "Libavutil/rational.h"
+#include "Libavutil/version.h"
 
-#include "libavcodec/version_major.h"
+#include "Libavcodec/version_major.h"
 
 /**
  * @defgroup lavc_packet_side_data AVPacketSideData

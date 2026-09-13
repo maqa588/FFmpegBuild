@@ -33,9 +33,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "libavutil/buffer.h"
-#include "libavutil/dict.h"
-#include "libavutil/rational.h"
+#include "Libavutil/buffer.h"
+#include "Libavutil/dict.h"
+#include "Libavutil/rational.h"
 #include "version_major.h"
 
 /** Data type identifiers for TIFF tags */

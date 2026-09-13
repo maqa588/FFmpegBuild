@@ -23,7 +23,7 @@
 
 #include <mfxvideo.h>
 
-#include "libavutil/buffer.h"
+#include "Libavutil/buffer.h"
 
 /**
  * This struct is used for communicating QSV parameters between libavcodec and

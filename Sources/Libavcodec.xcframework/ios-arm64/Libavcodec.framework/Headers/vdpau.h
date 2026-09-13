@@ -51,8 +51,8 @@
 
 #include <vdpau/vdpau.h>
 
-#include "libavutil/avconfig.h"
-#include "libavutil/attributes.h"
+#include "Libavutil/avconfig.h"
+#include "Libavutil/attributes.h"
 
 #include "avcodec.h"
 
