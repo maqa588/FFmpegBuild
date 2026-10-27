@@ -4,14 +4,14 @@
 # Includes dav1d (fast AV1 software decoder).
 #
 # Usage:
-#   ./build.sh          # Build iOS arm64 + macOS universal dynamic frameworks
+#   ./build.sh          # Build iOS device + simulator + macOS universal dynamic frameworks
 #   ./build.sh static   # Build static variant (not App Store friendly for closed-source apps)
 #   ./build.sh package  # Repackage frameworks from existing build products
 #   ./build.sh clean    # Remove all build artifacts
 #
 set -eo pipefail  # pipefail so `... | tail -N` doesn't swallow configure/make errors
 
-FFMPEG_VERSION="n8.1.2"
+FFMPEG_VERSION="n8.1.3"
 FFMPEG_REPO="https://github.com/FFmpeg/FFmpeg.git"
 DAV1D_VERSION="1.5.4"
 DAV1D_REPO="https://code.videolan.org/videolan/dav1d.git"
@@ -155,6 +155,261 @@ s#        if \(track->time_scale < 0\.01\) \{\n            av_log\(matroska->ctx
         echo "ERROR: matroska TrackTimestampScale patch did not apply (upstream source changed?)"
         exit 1
     fi
+}
+
+patch_ffmpeg_vc1_parser() {
+    # AetherEngine #490 (FFmpeg PR 24458). libavformat closes and reopens the parser on
+    # every reposition (ff_read_frame_flush), and vc1_parser.c never seeds its VC1Context
+    # from avctx->extradata the way vc1_decode_init does. So after a seek the context has
+    # profile 0 and max_coded_width/height 0 until an in-stream sequence header happens to
+    # pass, and an entry point landing there is read at the wrong bit offset: hrd_full[]
+    # precedes coded_size_flag only when the sequence header set hrd_param_flag, which a
+    # zeroed context cannot know. The bit taken for coded_size_flag is then the top bit of
+    # hrd_full[0], the leaky bucket fullness at that entry point, so a bucket below half
+    # full falls back to the zero pair ("Picture size 0x0 is invalid") and one above half
+    # takes a coded size out of the following payload, silently. The same context also
+    # sends an advanced profile frame header through the simple/main reader, so pict_type
+    # and repeat_pict, which libavformat turns into the packet key flag and the packet
+    # duration, come out of the wrong reader after every seek.
+    local F="${FFMPEG_SRC}/libavcodec/vc1_parser.c"
+    grep -q "vc1_parse_extradata" "${F}" && return
+    echo "→ Patching FFmpeg: seed the VC-1 parse context from extradata (AetherEngine #490)"
+    local SEED
+    SEED=$(cat <<'VC1SEEDEOF'
+/**
+ * Seed the parse context from extradata, the way the decoder does at init.
+ *
+ * libavformat closes and reopens the parser on every reposition
+ * (ff_read_frame_flush()), so each seek starts from a zeroed VC1Context: profile
+ * reads as simple, and max_coded_width/max_coded_height as zero, until an
+ * in-stream sequence header happens to pass. An entry point reaching a context in
+ * that state is read at the wrong bit offset, because whether hrd_full[] precedes
+ * coded_size_flag is a property of the sequence header, and the size it then
+ * falls back to is the zero pair.
+ */
+static void vc1_parse_extradata(AVCodecParserContext *s, AVCodecContext *avctx)
+{
+    VC1ParseContext *vpc = s->priv_data;
+    const uint8_t *start, *end, *next;
+    uint8_t *buf2;
+    GetBitContext gb;
+
+    if (!avctx->extradata || avctx->extradata_size < 16)
+        return;
+
+    buf2 = av_mallocz(avctx->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!buf2)
+        return;
+
+    vpc->v.s.avctx = avctx;
+    end   = avctx->extradata + avctx->extradata_size;
+    start = find_next_marker(avctx->extradata, end);
+    for (next = start; next < end; start = next) {
+        int size, buf2_size;
+
+        next = find_next_marker(start + 4, end);
+        size = next - start - 4;
+        if (size <= 0)
+            continue;
+        buf2_size = vpc->v.vc1dsp.vc1_unescape_buffer(start + 4, size, buf2);
+        if (init_get_bits8(&gb, buf2, buf2_size) < 0)
+            break;
+        switch (AV_RB32(start)) {
+        case VC1_CODE_SEQHDR:
+            if (ff_vc1_decode_sequence_header(avctx, &vpc->v, &gb) < 0)
+                goto done;
+            break;
+        case VC1_CODE_ENTRYPOINT:
+            if (ff_vc1_decode_entry_point(avctx, &vpc->v, &gb) < 0)
+                goto done;
+            break;
+        }
+    }
+
+done:
+    av_free(buf2);
+}
+
+VC1SEEDEOF
+)
+    VC1_SEED="${SEED}" perl -0777 -pi -e '
+s!\Q#include "libavutil/avassert.h"\E!#include "libavutil/avassert.h"\n#include "libavutil/mem.h"!;
+s!\Q    uint8_t prev_start_code;\E!    uint8_t prev_start_code;\n    uint8_t extradata_parsed;!;
+s!\Qstatic int vc1_parse(AVCodecParserContext *s,\E!$ENV{VC1_SEED} . qq{\n\n} . q{static int vc1_parse(AVCodecParserContext *s,}!e;
+s#\Q    int i = vpc->bytes_to_skip;\E\n#    int i = vpc->bytes_to_skip;\n\n    if (!vpc->extradata_parsed) {\n        vpc->extradata_parsed = 1;\n        vc1_parse_extradata(s, avctx);\n    }\n#;
+s!\Q    vpc->prev_start_code = 0;\E!    vpc->prev_start_code = 0;\n    vpc->extradata_parsed = 0;!;
+' "${F}"
+    if ! grep -q "vc1_parse_extradata" "${F}"; then
+        echo "ERROR: vc1_parser extradata seeding patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
+patch_ffmpeg_dav1_tag() {
+    # AetherEngine #547. MP4RA registers 'dav1' as the AV1 sample entry that signals
+    # Dolby Vision, and Apple's HLS authoring spec requires it for Dolby Vision
+    # Profile 10.0, the AV1 analogue of HEVC Profile 5: an IPT-PQ-c2 signal with no
+    # compatible base layer, so 'av01' is not an alternative there. FFmpeg knows the
+    # tag in neither direction (checked against master, 2026-09-18). Two tables, and
+    # both are needed: isom_tags.c maps the sample entry back to a codec id, so
+    # without it a 'dav1' MP4 probes as "unknown codec"; movenc.c's codec_mp4_tags is
+    # what validate_codec_tag() checks a requested tag against, so without it
+    # avformat_write_header fails with EINVAL and our remux never starts. 'dvh1' sits
+    # in that second table for the HEVC side already, which is why Profile 5 works.
+    # The cross-compatible profiles (10.1 / 10.4) ride an 'av01' sample entry with
+    # SUPPLEMENTAL-CODECS and are unaffected.
+    # Upstream as 4c6d67fe0f (PR 24556, merged 2026-09-18), master only, no release/8.1
+    # backport. The early return below makes this a no-op once FFMPEG_VERSION carries
+    # it, so drop this function on the FFmpeg 9.x bump.
+    local T="${FFMPEG_SRC}/libavformat/isom_tags.c"
+    local M="${FFMPEG_SRC}/libavformat/movenc.c"
+    if grep -q "'d', 'a', 'v', '1'" "${T}" && grep -q "'d', 'a', 'v', '1'" "${M}"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: accept the dav1 sample entry for AV1 Dolby Vision (AetherEngine #547)"
+    perl -0777 -pi -e '
+s#(\{ AV_CODEC_ID_AV1,  MKTAG\('"'"'a'"'"', '"'"'v'"'"', '"'"'0'"'"', '"'"'1'"'"'\) \}, /\* AV1 \*/\n)#$1    { AV_CODEC_ID_AV1,  MKTAG('"'"'d'"'"', '"'"'a'"'"', '"'"'v'"'"', '"'"'1'"'"') }, /* AV1-related Dolby Vision */\n#;
+' "${T}"
+    perl -0777 -pi -e '
+s#(\{ AV_CODEC_ID_AV1,             MKTAG\('"'"'a'"'"', '"'"'v'"'"', '"'"'0'"'"', '"'"'1'"'"'\) \},\n)#$1    { AV_CODEC_ID_AV1,             MKTAG('"'"'d'"'"', '"'"'a'"'"', '"'"'v'"'"', '"'"'1'"'"') },\n#;
+' "${M}"
+    if ! grep -q "'d', 'a', 'v', '1'" "${T}" || ! grep -q "'d', 'a', 'v', '1'" "${M}"; then
+        echo "ERROR: dav1 codec tag patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
+patch_ffmpeg_mpegts_mpeg1_probe() {
+    # AetherEngine #641. mpegts_set_stream_info() takes most PMT stream types at their
+    # word, but asks for a content probe on two of them (request_probe = 50): 0x04
+    # (MPEG-2 audio) and 0x0f (AAC), because muxers are known to mislabel those. 0x03
+    # (MPEG-1 audio) is not on the list, so a PID that a restreamer labels 0x03 while
+    # it carries something else is opened as mp3 with no probe at all. The reporter's
+    # IPTV channel carries DTS-HD that way: every packet fails in mp3float ("Header
+    # missing") and the audio track never produces a frame. The same bytes labelled
+    # 0x04, 0x06, 0x0f or an unknown type all probe as DTS. Putting 0x03 on the list
+    # costs a genuine MPEG audio PID nothing: mp3 and mp2 both settle on the first
+    # PES packet, and a probe that finds nothing better keeps the PMT's codec.
+    # Proposed upstream as FFmpeg PR 24697.
+    local F="${FFMPEG_SRC}/libavformat/mpegts.c"
+    if grep -q "pes->stream_type == STREAM_TYPE_AUDIO_MPEG1 ||" "${F}"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: probe the content of a PID labelled MPEG-1 audio (AetherEngine #641)"
+    perl -0777 -pi -e '
+s!    if \(pes->stream_type == STREAM_TYPE_AUDIO_MPEG2 \|\| pes->stream_type == STREAM_TYPE_AUDIO_AAC\)\n!    if (pes->stream_type == STREAM_TYPE_AUDIO_MPEG1 ||\n        pes->stream_type == STREAM_TYPE_AUDIO_MPEG2 ||\n        pes->stream_type == STREAM_TYPE_AUDIO_AAC)\n!;
+' "${F}"
+    if ! grep -q "pes->stream_type == STREAM_TYPE_AUDIO_MPEG1 ||" "${F}"; then
+        echo "ERROR: mpegts MPEG-1 audio probe patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
+patch_ffmpeg_eac3_dec3() {
+    # AetherEngine #728. movenc's handle_eac3() builds the dec3 box from the first
+    # access unit, and gets two fields wrong once a dependent substream is involved.
+    # A Blu-ray style track (AC-3 core plus an E-AC-3 dependent frame carrying the
+    # height channels and the Atmos objects) then reads as a bare 5.1 bed: tvOS
+    # decodes the core and an Atmos receiver reports multichannel PCM.
+    #
+    # 1. chan_loc was derived from chanmap with a plain shift and a five-bit mask,
+    #    but chanmap is read MSB-first and chan_loc spans nine bits, so 5.1.2
+    #    (chanmap 0x0010 / 0xA010) came out as 0 instead of Lvh/Rvh (0x040). This is
+    #    upstream f10fdd6310, master only; the block is skipped once the pinned tag
+    #    carries it.
+    # 2. complexity_index_type_a (the ETSI TS 103 420 JOC extension) was taken from
+    #    the independent substream only, and re-read on every packet. With the
+    #    objects in the dependent frame it is 0 there, so the box lost the extension.
+    #    It is now taken from every substream of the access unit and kept at its
+    #    maximum, like data_rate. Proposed upstream as FFmpeg PR 24963.
+    local F="${FFMPEG_SRC}/libavformat/movenc.c"
+    if ! grep -q "(hdr->channel_map >> (10 - j)) & 1" "${F}"; then
+        echo "→ Patching FFmpeg: dec3 chan_loc from a dependent substream's chanmap (upstream f10fdd6310, AetherEngine #728)"
+        perl -0777 -pi -e '
+s#\Q                if (hdr->channel_map_present)
+                    info->substream[parent].chan_loc |= (hdr->channel_map >> 5) & 0x1f;
+                else
+                    info->substream[parent].chan_loc |= hdr->channel_mode;
+\E#                if (hdr->channel_map_present) {
+                    /* chanmap is a 16-bit field read MSB-first, so flag index
+                     * i sits at bit (15 - i). chan_loc bits 0-7 carry flag
+                     * indices 5-12, i.e. chanmap bit (10 - j); index 13
+                     * (Lts/Rts) has no chan_loc bit, and chan_loc bit 8 carries
+                     * LFE2, index 14, chanmap bit 1. */
+                    for (int j = 0; j < 8; j++) {
+                        if ((hdr->channel_map >> (10 - j)) & 1)
+                            info->substream[parent].chan_loc |= 1 << j;
+                    }
+                    if ((hdr->channel_map >> 1) & 1)
+                        info->substream[parent].chan_loc |= 1 << 8;
+                } else {
+                    info->substream[parent].chan_loc |= hdr->channel_mode;
+                }
+#;
+' "${F}"
+        if ! grep -q "(hdr->channel_map >> (10 - j)) & 1" "${F}"; then
+            echo "ERROR: dec3 chan_loc patch did not apply (upstream source changed?)"
+            exit 1
+        fi
+    fi
+    if grep -q "carried by a dependent substream" "${F}"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: dec3 keeps the JOC extension of a dependent substream (AetherEngine #728)"
+    perl -0777 -pi -e '
+s#\Q    info->complexity_index_type_a = hdr->complexity_index_type_a;\E\n#    info->complexity_index_type_a = FFMAX(info->complexity_index_type_a,\n                                          hdr->complexity_index_type_a);\n#;
+s#(\n)(                cumul_size \+= hdr->frame_size;\n)#$1                /* the JOC extension may be carried by a dependent substream\n                 * only, e.g. an AC-3 core with the objects in an E-AC-3\n                 * dependent frame (ETSI TS 103 420) */\n                info->complexity_index_type_a = FFMAX(info->complexity_index_type_a,\n                                                      hdr->complexity_index_type_a);\n$2#;
+' "${F}"
+    if ! grep -q "carried by a dependent substream" "${F}" || \
+       [ "$(grep -c "info->complexity_index_type_a = FFMAX" "${F}")" != "2" ]; then
+        echo "ERROR: dec3 JOC extension patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
+patch_ffmpeg_movenc_fragment_end() {
+    # StreamX crash 2026-10-10 (AetherEngine HLS segment pump). mov_flush_fragment()
+    # fills in a track's end from the first packet still waiting in the interleaver
+    # (ff_interleaved_peek). check_pkt() may already have moved the written samples
+    # past that packet's dts: the first sample of a fragment is placed at the previous
+    # fragment's declared end, and every later one that still sits below it is clamped
+    # to the sample before plus one. The track end then lies before its last sample,
+    # get_cluster_duration() sees a negative duration and av_assert0() aborts the
+    # process. A queued packet behind the last written sample says nothing about where
+    # the track ends, so it is skipped, and the end stays what the sample's own duration
+    # gave it. Proposed upstream as FFmpeg PR 25021.
+    local F="${FFMPEG_SRC}/libavformat/movenc.c"
+    if grep -q "cannot end the track before them" "${F}"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: a queued packet behind the written samples does not end a fragment's track"
+    perl -0777 -pi -e '
+s#(                if \(track->dts_shift != AV_NOPTS_VALUE\)\n                    dts \+= track->dts_shift;\n)(                track->track_duration = dts - track->start_dts;\n)#$1                /* check_pkt() may have moved the written samples past this\n                 * packet; it cannot end the track before them. */\n                if (track->entry && dts < track->cluster[track->entry - 1].dts)\n                    continue;\n$2#;
+' "${F}"
+    if ! grep -q "cannot end the track before them" "${F}"; then
+        echo "ERROR: movenc fragment end patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
+patch_ffmpeg_dca_x_heights() {
+    # DTS:X heights without LibDTSX (AetherEngine #798). The standard presentation of DTS:X
+    # carries its four height channels in a regular XLL channel set at the end of every XLL
+    # frame, which upstream recognises (it sets the "DTS-HD MA + DTS:X" profile) but skips.
+    # The patch decodes that set with the existing channel set code, adds a decoder option
+    # "x_heights" (off by default) that outputs 7.1.4, and removes the -3 dB fold of each
+    # height from the bed speaker under it. Without the option the output is unchanged
+    # byte for byte. It lives in patches/ rather than inline: at this size a perl
+    # substitution would be unreadable. The patch header explains the format.
+    local P="${SCRIPT_DIR}/patches/dca-xll-x-heights.patch"
+    if grep -q '"x_heights"' "${FFMPEG_SRC}/libavcodec/dcadec.c"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: decode the DTS:X standard presentation's height channels (AetherEngine #798)"
+    git -C "${FFMPEG_SRC}" apply "${P}" || {
+        echo "ERROR: DTS:X height patch did not apply (upstream source changed?)"
+        exit 1
+    }
 }
 
 fetch_dav1d() {
@@ -430,6 +685,18 @@ COMMON_FLAGS=(
     # Some playback routes do not expose LPCM-side audio passthrough, so the
     # lossless stream is not necessarily delivered as multichannel output.
     --enable-encoder=eac3
+    # Upstream 3.8.0-3.10.0: RealMedia / 3GP / Theora / VobSub, the raw audio
+    # demuxers mpegts probes with, DVD LPCM, and the AAC / ALAC encoders.
+    --enable-demuxer=dts --enable-demuxer=truehd --enable-demuxer=loas
+    --enable-demuxer=rm --enable-demuxer=vobsub
+    --enable-decoder=rv10 --enable-decoder=rv20 --enable-decoder=rv30 --enable-decoder=rv40
+    --enable-decoder=cook --enable-decoder=atrac3 --enable-decoder=sipr --enable-decoder=ralf
+    --enable-decoder=ra_144 --enable-decoder=ra_288
+    --enable-decoder=h263 --enable-decoder=amrnb --enable-decoder=amrwb
+    --enable-decoder=theora
+    --enable-decoder=pcm_dvd
+    --enable-encoder=aac --enable-encoder=alac
+
 )
 
 build_one() {
@@ -595,8 +862,9 @@ EOF
     # target (ITMS-90208). These floors match Strophe's deployment targets.
     local MIN_OS SUPPORTED_PLATFORM
     case "${PLATFORM}" in
-        ios)   MIN_OS="16.0"; SUPPORTED_PLATFORM="iPhoneOS" ;;
-        macos) MIN_OS="13.0"; SUPPORTED_PLATFORM="MacOSX" ;;
+        ios)        MIN_OS="16.0"; SUPPORTED_PLATFORM="iPhoneOS" ;;
+        isimulator) MIN_OS="16.0"; SUPPORTED_PLATFORM="iPhoneSimulator" ;;
+        macos)      MIN_OS="13.0"; SUPPORTED_PLATFORM="MacOSX" ;;
         *)     echo "Unsupported framework platform: ${PLATFORM}"; return 1 ;;
     esac
 
@@ -656,6 +924,7 @@ make_xcframeworks() {
         local FW="${PAIR##*:}"
 
         make_framework "$LIB" "$FW" "ios"          ios-arm64
+        make_framework "$LIB" "$FW" "isimulator"   isimulator-arm64
         make_framework "$LIB" "$FW" "macos"        macos-arm64 macos-x86_64
 
         local XCF="${OUTPUT_DIR}/${FW}.xcframework"
@@ -664,6 +933,7 @@ make_xcframeworks() {
         echo "  → ${FW}.xcframework"
         xcodebuild -create-xcframework \
             -framework "${BUILD_DIR}/frameworks/ios/${FW}.framework" \
+            -framework "${BUILD_DIR}/frameworks/isimulator/${FW}.framework" \
             -framework "${BUILD_DIR}/frameworks/macos/${FW}.framework" \
             -output "${XCF}" 2>&1 | tail -1
         echo "  ✓ ${FW}.xcframework"
@@ -703,15 +973,23 @@ fetch_ffmpeg
 patch_ffmpeg_pgssub
 patch_ffmpeg_visionos
 patch_ffmpeg_matroska_tts
+patch_ffmpeg_vc1_parser
+patch_ffmpeg_dav1_tag
+patch_ffmpeg_mpegts_mpeg1_probe
+patch_ffmpeg_eac3_dec3
+patch_ffmpeg_movenc_fragment_end
+patch_ffmpeg_dca_x_heights
 fetch_dav1d
 
-# Build dav1d for the three supported architecture targets first.
+# Build dav1d for the four supported architecture targets first.
 build_dav1d_one ios-arm64          iphoneos         arm64  arm64-apple-ios16.0                    16.0
+build_dav1d_one isimulator-arm64   iphonesimulator  arm64  arm64-apple-ios16.0-simulator          16.0
 build_dav1d_one macos-arm64        macosx           arm64  arm64-apple-macos13.0                  13.0
 build_dav1d_one macos-x86_64       macosx           x86_64 x86_64-apple-macos13.0                 13.0
 
 # Build FFmpeg (links against dav1d)
 build_one ios-arm64          iphoneos         arm64  arm64-apple-ios16.0                    16.0
+build_one isimulator-arm64   iphonesimulator  arm64  arm64-apple-ios16.0-simulator          16.0
 build_one macos-arm64        macosx           arm64  arm64-apple-macos13.0                  13.0
 build_one macos-x86_64       macosx           x86_64 x86_64-apple-macos13.0                 13.0
 
